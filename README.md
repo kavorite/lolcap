@@ -23,9 +23,9 @@ setx PATH "%PATH%;%LOCALAPPDATA%\bin\nasm"
 ```
 
 
-> ![NOTE]
+> [!NOTE]
 > If you don't have Windows 10 version 1809 or later, you may see
-> `'winget' is not recognized as an internal or external command, operable program or batch file.`, 
+> `'winget' is not recognized as an internal or external command, operable program or batch file.`
 > In that case, the recommended way to install it is through [its Microsoft Store page](https://apps.microsoft.com/detail/9nblggh4nns1?hl=en-US&gl=US).
 
 ### Compiling
