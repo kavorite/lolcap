@@ -1,0 +1,22 @@
+[package]
+name = "gamecap"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.95"
+once_cell = "1.20.2"
+rav1e = "0.7.1"
+regex = "1.11.1"
+windows = { version = "0.59", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_System_SystemServices",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Accessibility",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_LibraryLoader"
+] }
