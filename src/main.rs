@@ -31,7 +31,7 @@ struct RecorderState {
     window_title: String,
     is_recording: Arc<AtomicBool>,
     output_directory: String,
-    session_id: usize,
+    session_id: Arc<AtomicUsize>,
     starting_chunk: usize,
 }
 
@@ -48,7 +48,7 @@ impl GameRecorder {
         fs::create_dir_all(output_dir)?;
 
         // Find highest existing session ID
-        let session_id = fs::read_dir(output_dir)?
+        let starting_session = fs::read_dir(output_dir)?
             .filter_map(|entry| entry.ok())
             .filter_map(|entry| {
                 entry.file_name()
@@ -59,28 +59,13 @@ impl GameRecorder {
             .max()
             .map_or(0, |max| max + 1);
 
-        // Find highest chunk number for this session
-        let starting_chunk = fs::read_dir(output_dir)?
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if !name.starts_with(&session_id.to_string()) {
-                    return None;
-                }
-                name.split('_')
-                    .nth(1)
-                    .and_then(|chunk| chunk.parse::<usize>().ok())
-            })
-            .max()
-            .map_or(0, |max| max + 1);
-
         Ok(Self {
             state: RecorderState {
                 window_title: window_title.to_string(),
                 is_recording: Arc::new(AtomicBool::new(false)),
                 output_directory: output_dir.to_string(),
-                session_id,
-                starting_chunk,
+                session_id: Arc::new(AtomicUsize::new(starting_session)),
+                starting_chunk: 0, // Reset to 0 for each session
             },
             hook: None,
         })
@@ -157,7 +142,11 @@ impl GameRecorder {
                 let is_recording = state.is_recording.load(Ordering::SeqCst);
 
                 match (title_matches, is_recording) {
-                    (true, false) => state.is_recording.store(true, Ordering::SeqCst),
+                    (true, false) => {
+                        // Increment session ID when starting a new recording
+                        state.session_id.fetch_add(1, Ordering::SeqCst);
+                        state.is_recording.store(true, Ordering::SeqCst);
+                    },
                     (false, true) => state.is_recording.store(false, Ordering::SeqCst),
                     _ => {}
                 }
@@ -185,8 +174,8 @@ impl RecorderState {
     fn get_segment_path(&self, segment: usize, suffix: &str) -> String {
         format!("{}/{}_{}{}", 
             self.output_directory,
-            self.session_id,
-            segment + self.starting_chunk,
+            self.session_id.load(Ordering::SeqCst),
+            segment,
             suffix
         )
     }
