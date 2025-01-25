@@ -36,7 +36,6 @@ struct RecorderState {
     is_recording: Arc<AtomicBool>,
     output_directory: String,
     session_id: Arc<AtomicUsize>,
-    starting_chunk: usize,
 }
 
 static RECORDER: Lazy<Arc<Mutex<Option<RecorderState>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
@@ -44,7 +43,7 @@ static RECORDER: Lazy<Arc<Mutex<Option<RecorderState>>>> = Lazy::new(|| Arc::new
 struct GameRecorder {
     state: RecorderState,
     hook: Option<HWINEVENTHOOK>,
-    recording_threads: Vec<thread::JoinHandle<Result<()>>>,
+    recording_threads: Vec<JoinHandle<Result<()>>>,
 }
 
 impl GameRecorder {
@@ -68,7 +67,6 @@ impl GameRecorder {
                 is_recording: Arc::new(AtomicBool::new(false)),
                 output_directory: output_dir.to_string(),
                 session_id: Arc::new(AtomicUsize::new(starting_session)),
-                starting_chunk: 0,
             },
             hook: None,
             recording_threads: Vec::new(),
@@ -81,110 +79,101 @@ impl GameRecorder {
         let video_active = Arc::clone(&self.state.is_recording);
         let video_state = self.state.clone();
         let video_thread = thread::spawn(move || -> Result<()> {
-            let mut segment = 0;
+            let output_path = video_state.get_output_path();
+            let mut output_file = File::create(&output_path)?;
             
-            while video_active.load(Ordering::SeqCst) {
-                let output_path = video_state.get_segment_path(segment, ".ivf");
-                let mut output_file = File::create(&output_path)?;
+            let enc = EncoderConfig {
+                width: 1920,
+                height: 1080,
+                speed_settings: SpeedSettings::from_preset(9),
+                time_base: Rational::new(1, 60),
+                ..Default::default()
+            };
+            let cfg = Config::new().with_encoder_config(enc.clone());
+            let mut ctx: rav1e::Context<u8> = cfg.new_context()
+                .map_err(|e| anyhow::anyhow!("Failed to create encoder context: {}", e))?;
+            
+            unsafe {
+                let screen_dc = GetDC(None);
+                let mem_dc = CreateCompatibleDC(Some(screen_dc));
+                ensure!(!mem_dc.is_invalid(), "Failed to create compatible DC");
+
+                let bitmap = CreateCompatibleBitmap(screen_dc, enc.width as i32, enc.height as i32);
+                ensure!(!bitmap.is_invalid(), "Failed to create bitmap");
+
+                let old_obj = SelectObject(mem_dc, bitmap.into());
+                ensure!(!old_obj.is_invalid(), "Failed to select bitmap");
                 
-                let enc = EncoderConfig {
-                    width: 1920,
-                    height: 1080,
-                    speed_settings: SpeedSettings::from_preset(9),
-                    time_base: Rational::new(1, 60),
-                    ..Default::default()
+                let mut bi = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: enc.width as i32,
+                        biHeight: -(enc.height as i32),
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: 0,
+                        biSizeImage: 0,
+                        biXPelsPerMeter: 0,
+                        biYPelsPerMeter: 0,
+                        biClrUsed: 0,
+                        biClrImportant: 0,
+                    },
+                    bmiColors: [Default::default(); 1],
                 };
-                let cfg = Config::new().with_encoder_config(enc.clone());
-                let mut ctx: rav1e::Context<u8> = cfg.new_context()
-                    .map_err(|e| anyhow::anyhow!("Failed to create encoder context: {}", e))?;
                 
-                let start_time = SystemTime::now();
-                
-                unsafe {
-                    let screen_dc = GetDC(None);
-                    let mem_dc = CreateCompatibleDC(Some(screen_dc));
-                    ensure!(!mem_dc.is_invalid(), "Failed to create compatible DC");
-
-                    let bitmap = CreateCompatibleBitmap(screen_dc, enc.width as i32, enc.height as i32);
-                    ensure!(!bitmap.is_invalid(), "Failed to create bitmap");
-
-                    let old_obj = SelectObject(mem_dc, bitmap.into());
-                    ensure!(!old_obj.is_invalid(), "Failed to select bitmap");
+                while video_active.load(Ordering::SeqCst) {
+                    let res = BitBlt(mem_dc, 0, 0, enc.width as i32, enc.height as i32,
+                                   Some(screen_dc), 0, 0, SRCCOPY);
+                    res.context("Failed to capture screen")?;
                     
-                    let mut bi = BITMAPINFO {
-                        bmiHeader: BITMAPINFOHEADER {
-                            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                            biWidth: enc.width as i32,
-                            biHeight: -(enc.height as i32),
-                            biPlanes: 1,
-                            biBitCount: 32,
-                            biCompression: 0,
-                            biSizeImage: 0,
-                            biXPelsPerMeter: 0,
-                            biYPelsPerMeter: 0,
-                            biClrUsed: 0,
-                            biClrImportant: 0,
-                        },
-                        bmiColors: [Default::default(); 1],
-                    };
+                    let mut pixels = vec![0u8; (enc.width * enc.height * 4) as usize];
+                    let scan_lines = GetDIBits(mem_dc, bitmap, 0, enc.height as u32,
+                                             Some(pixels.as_mut_ptr() as *mut _),
+                                             &mut bi, DIB_RGB_COLORS);
+                    ensure!(scan_lines != 0, "Failed to get bitmap data");
                     
-                    while video_active.load(Ordering::SeqCst) 
-                        && start_time.elapsed()?.as_secs() < 60 {
-                        let res = BitBlt(mem_dc, 0, 0, enc.width as i32, enc.height as i32,
-                                       Some(screen_dc), 0, 0, SRCCOPY);
-                        res.context("Failed to capture screen")?;
-                        
-                        let mut pixels = vec![0u8; (enc.width * enc.height * 4) as usize];
-                        let scan_lines = GetDIBits(mem_dc, bitmap, 0, enc.height as u32,
-                                                 Some(pixels.as_mut_ptr() as *mut _),
-                                                 &mut bi, DIB_RGB_COLORS);
-                        ensure!(scan_lines != 0, "Failed to get bitmap data");
-                        
-                        let mut rgb = Vec::with_capacity((enc.width * enc.height * 3) as usize);
-                        for chunk in pixels.chunks_exact(4) {
-                            rgb.push(chunk[2]);
-                            rgb.push(chunk[1]);
-                            rgb.push(chunk[0]);
-                        }
-                        
-                        let mut frame = ctx.new_frame();
-                        for p in &mut frame.planes {
-                            let stride = (enc.width + p.cfg.xdec) >> p.cfg.xdec;
-                            p.copy_from_raw_u8(&rgb, stride, 1);
-                        }
-                        
-                        match ctx.send_frame(frame) {
-                            Ok(_) => {}
-                            Err(EncoderStatus::EnoughData) => {
-                                while let Ok(packet) = ctx.receive_packet() {
-                                    output_file.write_all(&packet.data)?;
-                                }
+                    let mut rgb = Vec::with_capacity((enc.width * enc.height * 3) as usize);
+                    for chunk in pixels.chunks_exact(4) {
+                        rgb.push(chunk[2]);
+                        rgb.push(chunk[1]);
+                        rgb.push(chunk[0]);
+                    }
+                    
+                    let mut frame = ctx.new_frame();
+                    for p in &mut frame.planes {
+                        let stride = (enc.width + p.cfg.xdec) >> p.cfg.xdec;
+                        p.copy_from_raw_u8(&rgb, stride, 1);
+                    }
+                    
+                    match ctx.send_frame(frame) {
+                        Ok(_) => {}
+                        Err(EncoderStatus::EnoughData) => {
+                            while let Ok(packet) = ctx.receive_packet() {
+                                output_file.write_all(&packet.data)?;
                             }
-                            Err(e) => bail!("Failed to send frame: {}", e),
                         }
-                        
-                        thread::sleep(Duration::from_millis(16));
+                        Err(e) => bail!("Failed to send frame: {}", e),
                     }
                     
-                    let res = SelectObject(mem_dc, old_obj);
-                    ensure!(!res.is_invalid(), "Failed to restore old object");
-                    
-                    let res = DeleteObject(bitmap.into());
-                    ensure!(res.0 != 0, "Failed to delete bitmap");
-                    
-                    let res = DeleteDC(mem_dc);
-                    ensure!(res.0 != 0, "Failed to delete DC");
-                    
-                    let res = ReleaseDC(None, screen_dc);
-                    ensure!(res == 1, "Failed to release DC");
-                    
-                    ctx.flush();
-                    while let Ok(packet) = ctx.receive_packet() {
-                        output_file.write_all(&packet.data)?;
-                    }
+                    thread::sleep(Duration::from_millis(16));
                 }
                 
-                segment += 1;
+                let res = SelectObject(mem_dc, old_obj);
+                ensure!(!res.is_invalid(), "Failed to restore old object");
+                
+                let res = DeleteObject(bitmap.into());
+                ensure!(res.0 != 0, "Failed to delete bitmap");
+                
+                let res = DeleteDC(mem_dc);
+                ensure!(res.0 != 0, "Failed to delete DC");
+                
+                let res = ReleaseDC(None, screen_dc);
+                ensure!(res == 1, "Failed to release DC");
+                
+                ctx.flush();
+                while let Ok(packet) = ctx.receive_packet() {
+                    output_file.write_all(&packet.data)?;
+                }
             }
             Ok(())
         });
@@ -336,12 +325,10 @@ impl GameRecorder {
 }
 
 impl RecorderState {
-    fn get_segment_path(&self, segment: usize, suffix: &str) -> String {
-        format!("{}/{}_{}{}", 
+    fn get_output_path(&self) -> String {
+        format!("{}/{}.ivf", 
             self.output_directory,
-            self.session_id.load(Ordering::SeqCst),
-            segment,
-            suffix
+            self.session_id.load(Ordering::SeqCst)
         )
     }
 }
