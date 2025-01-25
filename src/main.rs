@@ -1,4 +1,5 @@
 use std::{
+    fs,
     sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}},
     thread,
     time::{Duration, SystemTime},
@@ -30,6 +31,8 @@ struct RecorderState {
     window_title: String,
     is_recording: Arc<AtomicBool>,
     output_directory: String,
+    session_id: usize,
+    starting_chunk: usize,
 }
 
 static RECORDER: Lazy<Arc<Mutex<Option<RecorderState>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
@@ -41,11 +44,43 @@ struct GameRecorder {
 
 impl GameRecorder {
     fn new(window_title: &str, output_dir: &str) -> Result<Self> {
+        // Create output directory if it doesn't exist
+        fs::create_dir_all(output_dir)?;
+
+        // Find highest existing session ID
+        let session_id = fs::read_dir(output_dir)?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                entry.file_name()
+                    .to_str()
+                    .and_then(|name| name.split('_').next())
+                    .and_then(|id| id.parse::<usize>().ok())
+            })
+            .max()
+            .map_or(0, |max| max + 1);
+
+        // Find highest chunk number for this session
+        let starting_chunk = fs::read_dir(output_dir)?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.starts_with(&session_id.to_string()) {
+                    return None;
+                }
+                name.split('_')
+                    .nth(1)
+                    .and_then(|chunk| chunk.parse::<usize>().ok())
+            })
+            .max()
+            .map_or(0, |max| max + 1);
+
         Ok(Self {
             state: RecorderState {
                 window_title: window_title.to_string(),
                 is_recording: Arc::new(AtomicBool::new(false)),
                 output_directory: output_dir.to_string(),
+                session_id,
+                starting_chunk,
             },
             hook: None,
         })
@@ -143,6 +178,17 @@ impl GameRecorder {
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+}
+
+impl RecorderState {
+    fn get_segment_path(&self, segment: usize, suffix: &str) -> String {
+        format!("{}/{}_{}{}", 
+            self.output_directory,
+            self.session_id,
+            segment + self.starting_chunk,
+            suffix
+        )
     }
 }
 
