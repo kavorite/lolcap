@@ -2,13 +2,15 @@ use std::{
     fs,
     sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}},
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, Instant},
     path::Path,
     io::Write,
     mem,
     fs::File,
+    collections::VecDeque,
 };
 use rav1e::prelude::*;
+use arrow::datatypes::{Schema, TimeUnit};
 use windows::{
     Win32::UI::WindowsAndMessaging::*,
     Win32::Foundation::*,
@@ -23,6 +25,15 @@ use windows::{
 use std::sync::Mutex;
 use once_cell::sync::Lazy;
 use anyhow::{Result, Context, bail, ensure};
+use arrow::{
+    array::{Int32Array, UInt32Array, TimestampMicrosecondArray},
+    record_batch::RecordBatch,
+};
+use parquet::{
+    arrow::ArrowWriter,
+    basic::Compression,
+    file::properties::WriterProperties,
+};
 
 // Constants that were in wrong modules
 const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
@@ -40,10 +51,44 @@ struct RecorderState {
 
 static RECORDER: Lazy<Arc<Mutex<Option<RecorderState>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
 
+struct InputBuffer {
+    timestamps: Vec<i64>,
+    event_types: Vec<u32>,
+    codes: Vec<u32>,
+    x_coords: Vec<i32>,
+    y_coords: Vec<i32>,
+    flags: Vec<u32>,
+}
+
+const BUFFER_SIZE: usize = 1024;
+static INPUT_WRITER: Lazy<Mutex<Option<ArrowWriter<File>>>> = Lazy::new(|| Mutex::new(None));
+static START_TIME: Lazy<Mutex<Option<Instant>>> = Lazy::new(|| Mutex::new(None));
+static INPUT_BUFFER: Lazy<Mutex<InputBuffer>> = Lazy::new(|| Mutex::new(InputBuffer {
+    timestamps: Vec::with_capacity(BUFFER_SIZE),
+    event_types: Vec::with_capacity(BUFFER_SIZE),
+    codes: Vec::with_capacity(BUFFER_SIZE),
+    x_coords: Vec::with_capacity(BUFFER_SIZE),
+    y_coords: Vec::with_capacity(BUFFER_SIZE),
+    flags: Vec::with_capacity(BUFFER_SIZE),
+}));
+
+static INPUT_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("timestamp_us", arrow::datatypes::DataType::Timestamp(TimeUnit::Microsecond, None), false),
+            arrow::datatypes::Field::new("event_type", arrow::datatypes::DataType::UInt32, false),
+            arrow::datatypes::Field::new("code", arrow::datatypes::DataType::UInt32, false),
+            arrow::datatypes::Field::new("x", arrow::datatypes::DataType::Int32, false),
+            arrow::datatypes::Field::new("y", arrow::datatypes::DataType::Int32, false),
+            arrow::datatypes::Field::new("flags", arrow::datatypes::DataType::UInt32, false),
+        ])));
+
+
+
 struct GameRecorder {
     state: RecorderState,
     hook: Option<HWINEVENTHOOK>,
     recording_threads: Vec<JoinHandle<Result<()>>>,
+    keyboard_hook: Option<HHOOK>,
+    mouse_hook: Option<HHOOK>,
 }
 
 impl GameRecorder {
@@ -70,11 +115,43 @@ impl GameRecorder {
             },
             hook: None,
             recording_threads: Vec::new(),
+            keyboard_hook: None,
+            mouse_hook: None,
         })
     }
 
     fn start_recording(&mut self) -> Result<()> {
         self.stop_recording();
+
+        let input_path = self.state.get_output_path().replace(".ivf", "_inputs.parquet");
+        let input_file = File::create(input_path)?;
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+
+        *INPUT_WRITER.lock().unwrap() = Some(ArrowWriter::try_new(
+            input_file,
+            Arc::clone(&INPUT_SCHEMA),
+            Some(props),
+        )?);
+        *START_TIME.lock().unwrap() = Some(Instant::now());
+
+        unsafe {
+            self.keyboard_hook = Some(SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(Self::keyboard_hook_proc),
+                None,
+                0,
+            )?);
+
+            self.mouse_hook = Some(SetWindowsHookExW(
+                WH_MOUSE_LL,
+                Some(Self::mouse_hook_proc),
+                None,
+                0,
+            )?);
+        }
 
         let video_active = Arc::clone(&self.state.is_recording);
         let video_state = self.state.clone();
@@ -183,7 +260,42 @@ impl GameRecorder {
     }
 
     fn stop_recording(&mut self) {
-        // Wait for threads to finish and check for errors
+        // Clean up hooks
+        if let Some(hook) = self.keyboard_hook.take() {
+            unsafe { UnhookWindowsHookEx(hook); }
+        }
+        if let Some(hook) = self.mouse_hook.take() {
+            unsafe { UnhookWindowsHookEx(hook); }
+        }
+
+        // Write any remaining buffered events
+        let buffer = INPUT_BUFFER.lock().unwrap();
+        if !buffer.timestamps.is_empty() {
+            if let Some(writer) = &mut *INPUT_WRITER.lock().unwrap() {
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&INPUT_SCHEMA),
+                    vec![
+                        Arc::new(TimestampMicrosecondArray::from(buffer.timestamps.clone())),
+                        Arc::new(UInt32Array::from(buffer.event_types.clone())),
+                        Arc::new(UInt32Array::from(buffer.codes.clone())),
+                        Arc::new(Int32Array::from(buffer.x_coords.clone())),
+                        Arc::new(Int32Array::from(buffer.y_coords.clone())),
+                        Arc::new(UInt32Array::from(buffer.flags.clone())),
+                    ],
+                ).unwrap();
+                let _ = writer.write(&batch);
+            }
+        }
+
+        // Close Arrow writer
+        if let Some(writer) = INPUT_WRITER.lock().unwrap().take() {
+            if let Err(e) = writer.close() {
+                eprintln!("Error closing input writer: {}", e);
+            }
+        }
+        *START_TIME.lock().unwrap() = None;
+
+        // Join video thread
         while let Some(handle) = self.recording_threads.pop() {
             if let Err(e) = handle.join().unwrap() {
                 eprintln!("Recording thread error: {}", e);
@@ -321,6 +433,98 @@ impl GameRecorder {
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+
+    unsafe extern "system" fn keyboard_hook_proc(
+        code: i32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if code >= 0 {
+            if let Some(start_time) = &*START_TIME.lock().unwrap() {
+                let kbd_struct = *(lparam.0 as *const KBDLLHOOKSTRUCT);
+                let timestamp = start_time.elapsed().as_micros() as i64;
+                
+                let mut buffer = INPUT_BUFFER.lock().unwrap();
+                buffer.timestamps.push(timestamp);
+                buffer.event_types.push(0);  // keyboard
+                buffer.codes.push(kbd_struct.vkCode);
+                buffer.x_coords.push(0);
+                buffer.y_coords.push(0);
+                buffer.flags.push(kbd_struct.flags.0);
+
+                if buffer.timestamps.len() >= BUFFER_SIZE {
+                    if let Some(writer) = &mut *INPUT_WRITER.lock().unwrap() {
+                        let batch = RecordBatch::try_new(
+                            Arc::clone(&INPUT_SCHEMA),
+                            vec![
+                                Arc::new(TimestampMicrosecondArray::from(buffer.timestamps.clone())),
+                                Arc::new(UInt32Array::from(buffer.event_types.clone())),
+                                Arc::new(UInt32Array::from(buffer.codes.clone())),
+                                Arc::new(Int32Array::from(buffer.x_coords.clone())),
+                                Arc::new(Int32Array::from(buffer.y_coords.clone())),
+                                Arc::new(UInt32Array::from(buffer.flags.clone())),
+                            ],
+                        ).unwrap();
+                        let _ = writer.write(&batch);
+                        
+                        buffer.timestamps.clear();
+                        buffer.event_types.clear();
+                        buffer.codes.clear();
+                        buffer.x_coords.clear();
+                        buffer.y_coords.clear();
+                        buffer.flags.clear();
+                    }
+                }
+            }
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+
+    unsafe extern "system" fn mouse_hook_proc(
+        code: i32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if code >= 0 {
+            if let Some(start_time) = &*START_TIME.lock().unwrap() {
+                let mouse_struct = *(lparam.0 as *const MSLLHOOKSTRUCT);
+                let timestamp = start_time.elapsed().as_micros() as i64;
+                
+                let mut buffer = INPUT_BUFFER.lock().unwrap();
+                buffer.timestamps.push(timestamp);
+                buffer.event_types.push(1);  // mouse
+                buffer.codes.push(mouse_struct.mouseData);
+                buffer.x_coords.push(mouse_struct.pt.x);
+                buffer.y_coords.push(mouse_struct.pt.y);
+                buffer.flags.push(mouse_struct.flags);
+
+                if buffer.timestamps.len() >= 1000 {
+                    if let Some(writer) = &mut *INPUT_WRITER.lock().unwrap() {
+                        let batch = RecordBatch::try_new(
+                            Arc::clone(&INPUT_SCHEMA),
+                            vec![
+                                Arc::new(TimestampMicrosecondArray::from(buffer.timestamps.clone())),
+                                Arc::new(UInt32Array::from(buffer.event_types.clone())),
+                                Arc::new(UInt32Array::from(buffer.codes.clone())),
+                                Arc::new(Int32Array::from(buffer.x_coords.clone())),
+                                Arc::new(Int32Array::from(buffer.y_coords.clone())),
+                                Arc::new(UInt32Array::from(buffer.flags.clone())),
+                            ],
+                        ).unwrap();
+                        let _ = writer.write(&batch);
+                        
+                        buffer.timestamps.clear();
+                        buffer.event_types.clear();
+                        buffer.codes.clear();
+                        buffer.x_coords.clear();
+                        buffer.y_coords.clear();
+                        buffer.flags.clear();
+                    }
+                }
+            }
+        }
+        CallNextHookEx(None, code, wparam, lparam)
     }
 }
 
