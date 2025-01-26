@@ -15,7 +15,7 @@ rustup toolchain install nightly
 ```
 
 ### The Netwide Assembler
-This is required for a default feature in in [rav1e](https://github.com/xiph/rav1e/) for hardware-acceleration of video encoding on supported CPUs.
+This is required for a default feature in [rav1e](https://github.com/xiph/rav1e/) for hardware-acceleration of video encoding on supported CPUs.
 
 ```batch
 winget nasm
