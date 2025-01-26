@@ -6,7 +6,7 @@ This thing watches you play League of Legends. Caveat emptor.
 
 ### Getting Rust
 
-Install `rustup` for Windows from https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe. 
+Install `rustup` for Windows from [rust-lang.org](https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe).
 
 
 Then, run:
