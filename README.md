@@ -12,6 +12,7 @@ Install `rustup` for Windows from [rust-lang.org](https://static.rust-lang.org/r
 Then, run:
 ```batch
 rustup toolchain install nightly
+setx PATH "%PATH%;%USERPROFILE%\.cargo\bin"
 ```
 
 ### The Netwide Assembler
