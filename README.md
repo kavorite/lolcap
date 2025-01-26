@@ -38,5 +38,7 @@ cargo build --release
 #### Optional: Configuring as a startup application
 
 ```batch
-copy target\release\lolcap.exe "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
+move "%CD%\target\release\lolcap.exe" "%CD%"
+mkdir /p "recordings"
+mklink "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\lolcap.lnk" "%CD%\lolcap.exe"
 ```
