@@ -12,14 +12,13 @@ Install `rustup` for Windows from [rust-lang.org](https://static.rust-lang.org/r
 Then, run:
 ```batch
 rustup toolchain install nightly
-setx PATH "%PATH%;%USERPROFILE%\.cargo\bin"
 ```
 
 ### The Netwide Assembler
 This is required for a default feature in [rav1e](https://github.com/xiph/rav1e/) for hardware-acceleration of video encoding on supported CPUs.
 
 ```batch
-winget nasm
+winget install nasm
 setx PATH "%PATH%;%LOCALAPPDATA%\bin\nasm"
 ```
 
