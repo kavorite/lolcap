@@ -10,21 +10,21 @@ use std::{
     fs::File,
     collections::VecDeque,
 };
-use rav1e::prelude::*;
 use arrow::datatypes::{Schema, TimeUnit};
 use windows::{
-    Win32::UI::WindowsAndMessaging::*,
-    Win32::Foundation::*,
-    Win32::UI::Input::KeyboardAndMouse::*,
+    Win32::UI::WindowsAndMessaging::{
+        WNDCLASSW, CreateWindowExW, DefWindowProcW, GetMessageW,
+        PostMessageW, PostQuitMessage, RegisterClassW, TranslateMessage,
+        DispatchMessageW, WINDOW_EX_STYLE, WINDOW_STYLE, CW_USEDEFAULT,
+        WM_DESTROY, WM_USER, MSG, GetWindowTextLengthW, GetWindowTextW,
+        SetWindowsHookExW, UnhookWindowsHookEx, CallNextHookEx,
+        WH_KEYBOARD_LL, WH_MOUSE_LL, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT, HHOOK,
+    },
+    Win32::Foundation::{HWND, WPARAM, LPARAM, LRESULT, BOOL},
+    Win32::UI::Input::KeyboardAndMouse,
     Win32::UI::Accessibility::*,
     Win32::System::LibraryLoader::GetModuleHandleW,
-    Win32::Graphics::Gdi::{GetDC, ReleaseDC, BitBlt, CreateCompatibleDC, CreateCompatibleBitmap, 
-                          SelectObject, SRCCOPY, DeleteObject, GetDIBits, BITMAPINFO, 
-                          BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteDC, BI_RGB},
     core::*,
-    Win32::Graphics::Direct3D11::*,
-    Win32::Graphics::Dxgi::*,
-    Win32::Graphics::Direct3D::*,
 };
 use std::sync::Mutex;
 use once_cell::sync::Lazy;
@@ -202,7 +202,7 @@ impl GameRecorder {
 
     fn start_recording(&mut self) -> Result<()> {
         println!("=== START RECORDING ===");
-        self.stop_recording();
+        self.stop_recording()?;
 
         let input_path = self.state.get_output_path().replace(".mp4", "_inputs.parquet");
         println!("Creating input file: {}", input_path);
@@ -259,18 +259,16 @@ impl GameRecorder {
         Ok(())
     }
 
-    fn stop_recording(&mut self) {
-        println!("In stop_recording"); // Debug logging
-        
+    fn stop_recording(&mut self) -> Result<()> {
         // Clean up hooks
         if let Some(hook) = self.keyboard_hook.take() {
-            unsafe { UnhookWindowsHookEx(hook); }
+            unsafe { UnhookWindowsHookEx(hook)? };
         }
         if let Some(hook) = self.mouse_hook.take() {
-            unsafe { UnhookWindowsHookEx(hook); }
+            unsafe { UnhookWindowsHookEx(hook)? };
         }
 
-        // Write any remaining buffered events and ensure they're flushed to disk
+        // Write any remaining buffered events
         {
             let buffer = INPUT_BUFFER.lock().unwrap();
             if !buffer.timestamps.is_empty() {
@@ -285,27 +283,22 @@ impl GameRecorder {
                             Arc::new(Int32Array::from(buffer.y_coords.clone())),
                             Arc::new(UInt32Array::from(buffer.flags.clone())),
                         ],
-                    ).unwrap();
-                    let _ = writer.write(&batch);
-                    // Force flush the writer
-                    let _ = writer.flush();
+                    )?;
+                    writer.write(&batch)?;
+                    writer.flush()?;
                 }
             }
         }
 
         // Close Arrow writer
         if let Some(writer) = INPUT_WRITER.lock().unwrap().take() {
-            if let Err(e) = writer.close() {
-                eprintln!("Error closing input writer: {}", e);
-            }
+            writer.close()?;
         }
         *START_TIME.lock().unwrap() = None;
 
-        // Join video thread and ensure it's properly flushed
+        // Join video thread
         while let Some(handle) = self.recording_threads.pop() {
-            if let Err(e) = handle.join().unwrap() {
-                eprintln!("Recording thread error: {}", e);
-            }
+            handle.join().map_err(|e| anyhow::anyhow!("Recording thread panicked: {:?}", e))??;
         }
 
         // Clear the input buffer
@@ -316,29 +309,25 @@ impl GameRecorder {
         buffer.x_coords.clear();
         buffer.y_coords.clear();
         buffer.flags.clear();
+
+        Ok(())
     }
 
-    fn check_thread_errors(&mut self) {
+    fn check_thread_errors(&mut self) -> Result<()> {
         let mut i = 0;
         while i < self.recording_threads.len() {
             if self.recording_threads[i].is_finished() {
-                println!("Thread finished, checking for errors"); // Debug logging
-                match self.recording_threads.remove(i).join().unwrap() {
-                    Ok(_) => println!("Thread completed successfully"),
-                    Err(e) => {
-                        eprintln!("Thread error: {}", e);
-                        self.state.is_recording.store(false, Ordering::SeqCst);
-                    }
-                }
+                self.recording_threads.remove(i).join()
+                    .map_err(|e| anyhow::anyhow!("Recording thread panicked: {:?}", e))??;
             } else {
                 i += 1;
             }
         }
+        Ok(())
     }
 
     fn run(&mut self) -> Result<()> {
         unsafe {
-            println!("Starting recorder run");
             *RECORDER.lock().unwrap() = Some(self.state.clone());
 
             let window_class = w!("GameRecorderClass");
@@ -366,8 +355,6 @@ impl GameRecorder {
                 None,
             )?;
 
-            println!("Created window: {:?}", hwnd);
-
             let hook = SetWinEventHook(
                 EVENT_SYSTEM_FOREGROUND,
                 EVENT_SYSTEM_FOREGROUND,
@@ -379,26 +366,14 @@ impl GameRecorder {
             );
 
             self.hook = Some(hook);
-            println!("Set up event hook: {:?}", hook);
 
             let mut message = MSG::default();
-            println!("Entering message loop");
-            
             while GetMessageW(&mut message, None, 0, 0).as_bool() {
                 match message.message {
                     WM_USER => {
                         match message.wParam.0 {
-                            1 => {
-                                println!("=== Starting recording ===");
-                                if let Err(e) = self.start_recording() {
-                                    println!("Failed to start recording: {:#}", e);
-                                    self.state.is_recording.store(false, Ordering::SeqCst);
-                                }
-                            },
-                            0 => {
-                                println!("=== Stopping recording ===");
-                                self.stop_recording();
-                            },
+                            1 => self.start_recording()?,
+                            0 => self.stop_recording()?,
                             _ => {}
                         }
                     },
@@ -407,8 +382,7 @@ impl GameRecorder {
                         DispatchMessageW(&message);
                     }
                 }
-
-                self.check_thread_errors();
+                self.check_thread_errors()?;
             }
         }
         Ok(())
@@ -423,37 +397,30 @@ impl GameRecorder {
         _id_event_thread: u32,
         _dwms_event_time: u32,
     ) {
-        // Only process foreground window changes
         if event != EVENT_SYSTEM_FOREGROUND {
             return;
         }
 
-        // Get the title of the window that's becoming foreground
         if let Some(title) = get_window_title(hwnd) {
-            // Ignore Task Switching window
             if title == "Task Switching" {
                 return;
             }
 
             if let Some(state) = RECORDER.lock().unwrap().as_ref() {
-                println!("Window focus changed to: {}", title);
-                
                 let title_matches = title == state.window_title;
                 let is_recording = state.is_recording.load(Ordering::SeqCst);
 
-                println!("State check - title_matches: {}, is_recording: {}", title_matches, is_recording);
-
                 match (title_matches, is_recording) {
                     (true, false) => {
-                        println!("Game window focused, starting recording");
                         state.session_id.fetch_add(1, Ordering::SeqCst);
                         state.is_recording.store(true, Ordering::SeqCst);
-                        PostMessageW(Some(HWND(std::ptr::null_mut())), WM_USER, WPARAM(1), LPARAM(0));
+                        if PostMessageW(Some(HWND(std::ptr::null_mut())), WM_USER, WPARAM(1), LPARAM(0)).is_err() {
+                            state.is_recording.store(false, Ordering::SeqCst);
+                        }
                     },
                     (false, true) => {
-                        println!("Game window unfocused, stopping recording");
                         state.is_recording.store(false, Ordering::SeqCst);
-                        PostMessageW(Some(HWND(std::ptr::null_mut())), WM_USER, WPARAM(0), LPARAM(0));
+                        let _ = PostMessageW(Some(HWND(std::ptr::null_mut())), WM_USER, WPARAM(0), LPARAM(0));
                     },
                     _ => {}
                 }
