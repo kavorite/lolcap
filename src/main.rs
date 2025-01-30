@@ -4,6 +4,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, Instant},
     path::Path,
+    ptr::addr_of,
     io::Write,
     mem,
     fs::File,
@@ -19,8 +20,11 @@ use windows::{
     Win32::System::LibraryLoader::GetModuleHandleW,
     Win32::Graphics::Gdi::{GetDC, ReleaseDC, BitBlt, CreateCompatibleDC, CreateCompatibleBitmap, 
                           SelectObject, SRCCOPY, DeleteObject, GetDIBits, BITMAPINFO, 
-                          BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteDC},
+                          BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteDC, BI_RGB},
     core::*,
+    Win32::Graphics::Direct3D11::*,
+    Win32::Graphics::Dxgi::*,
+    Win32::Graphics::Direct3D::*,
 };
 use std::sync::Mutex;
 use once_cell::sync::Lazy;
@@ -33,6 +37,14 @@ use parquet::{
     arrow::ArrowWriter,
     basic::Compression,
     file::properties::WriterProperties,
+};
+use windows_capture::{
+    capture::{Context as CaptureContext, GraphicsCaptureApiHandler},
+    encoder::{VideoSettingsBuilder, AudioSettingsBuilder, ContainerSettingsBuilder, VideoEncoder},
+    frame::Frame,
+    graphics_capture_api::InternalCaptureControl,
+    settings::{ColorFormat, CursorCaptureSettings, DrawBorderSettings, Settings},
+    window::Window,
 };
 
 // Constants that were in wrong modules
@@ -47,6 +59,7 @@ struct RecorderState {
     is_recording: Arc<AtomicBool>,
     output_directory: String,
     session_id: Arc<AtomicUsize>,
+    last_window_change: Arc<Mutex<Instant>>,
 }
 
 static RECORDER: Lazy<Arc<Mutex<Option<RecorderState>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
@@ -81,14 +94,80 @@ static INPUT_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("flags", arrow::datatypes::DataType::UInt32, false),
         ])));
 
-
-
 struct GameRecorder {
     state: RecorderState,
     hook: Option<HWINEVENTHOOK>,
     recording_threads: Vec<JoinHandle<Result<()>>>,
     keyboard_hook: Option<HHOOK>,
     mouse_hook: Option<HHOOK>,
+}
+
+// New capture handler struct
+struct CaptureHandler {
+    encoder: Option<VideoEncoder>,
+    state: RecorderState,
+    target_width: u32,
+    target_height: u32,
+}
+
+impl GraphicsCaptureApiHandler for CaptureHandler {
+    type Flags = RecorderState;
+    type Error = anyhow::Error;
+
+    fn new(ctx: CaptureContext<Self::Flags>) -> Result<Self, Self::Error> {
+        let window = Window::from_name(&ctx.flags.window_title)?;
+        let rect = window.rect()?;
+        let source_width = (rect.right - rect.left) as u32;
+        let source_height = (rect.bottom - rect.top) as u32;
+        println!("Source window size: {}x{}", source_width, source_height);
+
+        // Target dimensions for the final video
+        let target_width = 854;
+        let target_height = 480;
+
+        // Create encoder at source resolution
+        let encoder = VideoEncoder::new(
+            VideoSettingsBuilder::new(source_width, source_height)
+                .frame_rate(30)
+                .bitrate(5000),
+            AudioSettingsBuilder::default().disabled(true),
+            ContainerSettingsBuilder::default(),
+            &ctx.flags.get_output_path(),
+        )?;
+
+        Ok(Self {
+            encoder: Some(encoder),
+            state: ctx.flags,
+            target_width,
+            target_height,
+        })
+    }
+
+    fn on_frame_arrived(
+        &mut self,
+        frame: &mut Frame,
+        capture_control: InternalCaptureControl,
+    ) -> Result<(), Self::Error> {
+        if !self.state.is_recording.load(Ordering::SeqCst) {
+            if let Some(encoder) = self.encoder.take() {
+                encoder.finish()?;
+            }
+            capture_control.stop();
+            return Ok(());
+        }
+
+        // Now we're capturing at full window resolution
+        if let Some(encoder) = &mut self.encoder {
+            encoder.send_frame(frame)?;
+        }
+
+        Ok(())
+    }
+
+    fn on_closed(&mut self) -> Result<(), Self::Error> {
+        println!("Capture session ended");
+        Ok(())
+    }
 }
 
 impl GameRecorder {
@@ -112,6 +191,7 @@ impl GameRecorder {
                 is_recording: Arc::new(AtomicBool::new(false)),
                 output_directory: output_dir.to_string(),
                 session_id: Arc::new(AtomicUsize::new(starting_session)),
+                last_window_change: Arc::new(Mutex::new(Instant::now())),
             },
             hook: None,
             recording_threads: Vec::new(),
@@ -121,9 +201,11 @@ impl GameRecorder {
     }
 
     fn start_recording(&mut self) -> Result<()> {
+        println!("=== START RECORDING ===");
         self.stop_recording();
 
-        let input_path = self.state.get_output_path().replace(".ivf", "_inputs.parquet");
+        let input_path = self.state.get_output_path().replace(".mp4", "_inputs.parquet");
+        println!("Creating input file: {}", input_path);
         let input_file = File::create(input_path)?;
 
         let props = WriterProperties::builder()
@@ -137,7 +219,9 @@ impl GameRecorder {
         )?);
         *START_TIME.lock().unwrap() = Some(Instant::now());
 
+        // Set up input hooks
         unsafe {
+            println!("Setting up input hooks");
             self.keyboard_hook = Some(SetWindowsHookExW(
                 WH_KEYBOARD_LL,
                 Some(Self::keyboard_hook_proc),
@@ -153,113 +237,31 @@ impl GameRecorder {
             )?);
         }
 
-        let video_active = Arc::clone(&self.state.is_recording);
+        // Start video capture using windows-capture
         let video_state = self.state.clone();
         let video_thread = thread::spawn(move || -> Result<()> {
-            let output_path = video_state.get_output_path();
-            let mut output_file = File::create(&output_path)?;
-            
-            let enc = EncoderConfig {
-                width: 1920,
-                height: 1080,
-                speed_settings: SpeedSettings::from_preset(9),
-                time_base: Rational::new(1, 60),
-                ..Default::default()
-            };
-            let cfg = Config::new().with_encoder_config(enc.clone());
-            let mut ctx: rav1e::Context<u8> = cfg.new_context()
-                .map_err(|e| anyhow::anyhow!("Failed to create encoder context: {}", e))?;
-            
-            unsafe {
-                let screen_dc = GetDC(None);
-                let mem_dc = CreateCompatibleDC(Some(screen_dc));
-                ensure!(!mem_dc.is_invalid(), "Failed to create compatible DC");
+            let window = Window::from_name(&video_state.window_title)?;
 
-                let bitmap = CreateCompatibleBitmap(screen_dc, enc.width as i32, enc.height as i32);
-                ensure!(!bitmap.is_invalid(), "Failed to create bitmap");
+            let settings = Settings::new(
+                window,
+                CursorCaptureSettings::WithCursor,
+                DrawBorderSettings::WithoutBorder,
+                ColorFormat::Bgra8,
+                video_state,
+            );
 
-                let old_obj = SelectObject(mem_dc, bitmap.into());
-                ensure!(!old_obj.is_invalid(), "Failed to select bitmap");
-                
-                let mut bi = BITMAPINFO {
-                    bmiHeader: BITMAPINFOHEADER {
-                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                        biWidth: enc.width as i32,
-                        biHeight: -(enc.height as i32),
-                        biPlanes: 1,
-                        biBitCount: 32,
-                        biCompression: 0,
-                        biSizeImage: 0,
-                        biXPelsPerMeter: 0,
-                        biYPelsPerMeter: 0,
-                        biClrUsed: 0,
-                        biClrImportant: 0,
-                    },
-                    bmiColors: [Default::default(); 1],
-                };
-                
-                while video_active.load(Ordering::SeqCst) {
-                    let res = BitBlt(mem_dc, 0, 0, enc.width as i32, enc.height as i32,
-                                   Some(screen_dc), 0, 0, SRCCOPY);
-                    res.context("Failed to capture screen")?;
-                    
-                    let mut pixels = vec![0u8; (enc.width * enc.height * 4) as usize];
-                    let scan_lines = GetDIBits(mem_dc, bitmap, 0, enc.height as u32,
-                                             Some(pixels.as_mut_ptr() as *mut _),
-                                             &mut bi, DIB_RGB_COLORS);
-                    ensure!(scan_lines != 0, "Failed to get bitmap data");
-                    
-                    let mut rgb = Vec::with_capacity((enc.width * enc.height * 3) as usize);
-                    for chunk in pixels.chunks_exact(4) {
-                        rgb.push(chunk[2]);
-                        rgb.push(chunk[1]);
-                        rgb.push(chunk[0]);
-                    }
-                    
-                    let mut frame = ctx.new_frame();
-                    for p in &mut frame.planes {
-                        let stride = (enc.width + p.cfg.xdec) >> p.cfg.xdec;
-                        p.copy_from_raw_u8(&rgb, stride, 1);
-                    }
-                    
-                    match ctx.send_frame(frame) {
-                        Ok(_) => {}
-                        Err(EncoderStatus::EnoughData) => {
-                            while let Ok(packet) = ctx.receive_packet() {
-                                output_file.write_all(&packet.data)?;
-                            }
-                        }
-                        Err(e) => bail!("Failed to send frame: {}", e),
-                    }
-                    
-                    thread::sleep(Duration::from_millis(16));
-                }
-                
-                let res = SelectObject(mem_dc, old_obj);
-                ensure!(!res.is_invalid(), "Failed to restore old object");
-                
-                let res = DeleteObject(bitmap.into());
-                ensure!(res.0 != 0, "Failed to delete bitmap");
-                
-                let res = DeleteDC(mem_dc);
-                ensure!(res.0 != 0, "Failed to delete DC");
-                
-                let res = ReleaseDC(None, screen_dc);
-                ensure!(res == 1, "Failed to release DC");
-                
-                ctx.flush();
-                while let Ok(packet) = ctx.receive_packet() {
-                    output_file.write_all(&packet.data)?;
-                }
-            }
+            CaptureHandler::start(settings)?;
             Ok(())
         });
 
         self.recording_threads.push(video_thread);
+        println!("=== RECORDING STARTED ===");
         Ok(())
     }
 
     fn stop_recording(&mut self) {
+        println!("In stop_recording"); // Debug logging
+        
         // Clean up hooks
         if let Some(hook) = self.keyboard_hook.take() {
             unsafe { UnhookWindowsHookEx(hook); }
@@ -268,22 +270,26 @@ impl GameRecorder {
             unsafe { UnhookWindowsHookEx(hook); }
         }
 
-        // Write any remaining buffered events
-        let buffer = INPUT_BUFFER.lock().unwrap();
-        if !buffer.timestamps.is_empty() {
-            if let Some(writer) = &mut *INPUT_WRITER.lock().unwrap() {
-                let batch = RecordBatch::try_new(
-                    Arc::clone(&INPUT_SCHEMA),
-                    vec![
-                        Arc::new(TimestampMicrosecondArray::from(buffer.timestamps.clone())),
-                        Arc::new(UInt32Array::from(buffer.event_types.clone())),
-                        Arc::new(UInt32Array::from(buffer.codes.clone())),
-                        Arc::new(Int32Array::from(buffer.x_coords.clone())),
-                        Arc::new(Int32Array::from(buffer.y_coords.clone())),
-                        Arc::new(UInt32Array::from(buffer.flags.clone())),
-                    ],
-                ).unwrap();
-                let _ = writer.write(&batch);
+        // Write any remaining buffered events and ensure they're flushed to disk
+        {
+            let buffer = INPUT_BUFFER.lock().unwrap();
+            if !buffer.timestamps.is_empty() {
+                if let Some(writer) = &mut *INPUT_WRITER.lock().unwrap() {
+                    let batch = RecordBatch::try_new(
+                        Arc::clone(&INPUT_SCHEMA),
+                        vec![
+                            Arc::new(TimestampMicrosecondArray::from(buffer.timestamps.clone())),
+                            Arc::new(UInt32Array::from(buffer.event_types.clone())),
+                            Arc::new(UInt32Array::from(buffer.codes.clone())),
+                            Arc::new(Int32Array::from(buffer.x_coords.clone())),
+                            Arc::new(Int32Array::from(buffer.y_coords.clone())),
+                            Arc::new(UInt32Array::from(buffer.flags.clone())),
+                        ],
+                    ).unwrap();
+                    let _ = writer.write(&batch);
+                    // Force flush the writer
+                    let _ = writer.flush();
+                }
             }
         }
 
@@ -295,22 +301,34 @@ impl GameRecorder {
         }
         *START_TIME.lock().unwrap() = None;
 
-        // Join video thread
+        // Join video thread and ensure it's properly flushed
         while let Some(handle) = self.recording_threads.pop() {
             if let Err(e) = handle.join().unwrap() {
                 eprintln!("Recording thread error: {}", e);
             }
         }
+
+        // Clear the input buffer
+        let mut buffer = INPUT_BUFFER.lock().unwrap();
+        buffer.timestamps.clear();
+        buffer.event_types.clear();
+        buffer.codes.clear();
+        buffer.x_coords.clear();
+        buffer.y_coords.clear();
+        buffer.flags.clear();
     }
 
     fn check_thread_errors(&mut self) {
         let mut i = 0;
         while i < self.recording_threads.len() {
             if self.recording_threads[i].is_finished() {
-                // Remove and take ownership of the handle
-                if let Err(e) = self.recording_threads.remove(i).join().unwrap() {
-                    eprintln!("Thread error: {}", e);
-                    self.state.is_recording.store(false, Ordering::SeqCst);
+                println!("Thread finished, checking for errors"); // Debug logging
+                match self.recording_threads.remove(i).join().unwrap() {
+                    Ok(_) => println!("Thread completed successfully"),
+                    Err(e) => {
+                        eprintln!("Thread error: {}", e);
+                        self.state.is_recording.store(false, Ordering::SeqCst);
+                    }
                 }
             } else {
                 i += 1;
@@ -320,6 +338,7 @@ impl GameRecorder {
 
     fn run(&mut self) -> Result<()> {
         unsafe {
+            println!("Starting recorder run");
             *RECORDER.lock().unwrap() = Some(self.state.clone());
 
             let window_class = w!("GameRecorderClass");
@@ -332,7 +351,7 @@ impl GameRecorder {
 
             RegisterClassW(&wc);
 
-            let _hwnd = CreateWindowExW(
+            let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 window_class,
                 w!("GameRecorder"),
@@ -345,7 +364,9 @@ impl GameRecorder {
                 None,
                 None,
                 None,
-            );
+            )?;
+
+            println!("Created window: {:?}", hwnd);
 
             let hook = SetWinEventHook(
                 EVENT_SYSTEM_FOREGROUND,
@@ -358,61 +379,81 @@ impl GameRecorder {
             );
 
             self.hook = Some(hook);
+            println!("Set up event hook: {:?}", hook);
 
             let mut message = MSG::default();
+            println!("Entering message loop");
+            
             while GetMessageW(&mut message, None, 0, 0).as_bool() {
-                // Check for thread errors periodically
+                match message.message {
+                    WM_USER => {
+                        match message.wParam.0 {
+                            1 => {
+                                println!("=== Starting recording ===");
+                                if let Err(e) = self.start_recording() {
+                                    println!("Failed to start recording: {:#}", e);
+                                    self.state.is_recording.store(false, Ordering::SeqCst);
+                                }
+                            },
+                            0 => {
+                                println!("=== Stopping recording ===");
+                                self.stop_recording();
+                            },
+                            _ => {}
+                        }
+                    },
+                    _ => {
+                        TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                }
+
                 self.check_thread_errors();
-
-                // Start recording if flag is set but threads aren't running
-                if self.state.is_recording.load(Ordering::SeqCst) 
-                    && self.recording_threads.is_empty() {
-                    self.start_recording()?;
-                }
-
-                // Stop recording if flag is cleared but threads are still running
-                if !self.state.is_recording.load(Ordering::SeqCst) 
-                    && !self.recording_threads.is_empty() {
-                    self.stop_recording();
-                }
-
-                let _ = TranslateMessage(&message);
-                let _ = DispatchMessageW(&message);
             }
-
-            // Cleanup
-            if let Some(hook) = self.hook {
-                let _ = UnhookWinEvent(hook);
-            }
-            self.stop_recording();
-            *RECORDER.lock().unwrap() = None;
         }
         Ok(())
     }
 
     unsafe extern "system" fn win_event_proc(
         _hook: HWINEVENTHOOK,
-        _event: u32,
+        event: u32,
         hwnd: HWND,
         _id_object: i32,
         _id_child: i32,
         _id_event_thread: u32,
         _dwms_event_time: u32,
     ) {
+        // Only process foreground window changes
+        if event != EVENT_SYSTEM_FOREGROUND {
+            return;
+        }
+
+        // Get the title of the window that's becoming foreground
         if let Some(title) = get_window_title(hwnd) {
+            // Ignore Task Switching window
+            if title == "Task Switching" {
+                return;
+            }
+
             if let Some(state) = RECORDER.lock().unwrap().as_ref() {
+                println!("Window focus changed to: {}", title);
+                
                 let title_matches = title == state.window_title;
                 let is_recording = state.is_recording.load(Ordering::SeqCst);
 
+                println!("State check - title_matches: {}, is_recording: {}", title_matches, is_recording);
+
                 match (title_matches, is_recording) {
                     (true, false) => {
+                        println!("Game window focused, starting recording");
                         state.session_id.fetch_add(1, Ordering::SeqCst);
                         state.is_recording.store(true, Ordering::SeqCst);
-                        // Thread management happens in the main loop
+                        PostMessageW(Some(HWND(std::ptr::null_mut())), WM_USER, WPARAM(1), LPARAM(0));
                     },
                     (false, true) => {
+                        println!("Game window unfocused, stopping recording");
                         state.is_recording.store(false, Ordering::SeqCst);
-                        // Thread cleanup happens in the main loop
+                        PostMessageW(Some(HWND(std::ptr::null_mut())), WM_USER, WPARAM(0), LPARAM(0));
                     },
                     _ => {}
                 }
@@ -530,7 +571,7 @@ impl GameRecorder {
 
 impl RecorderState {
     fn get_output_path(&self) -> String {
-        format!("{}/{}.ivf", 
+        format!("{}/{}.mp4", 
             self.output_directory,
             self.session_id.load(Ordering::SeqCst)
         )
