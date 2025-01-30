@@ -2,7 +2,7 @@ use std::{
     fs,
     sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}},
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, Instant},
+    time::Instant,
     path::Path,
     ptr::addr_of,
     io::Write,
@@ -97,9 +97,11 @@ static INPUT_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| Arc::new(Schema::new(vec![
 struct GameRecorder {
     state: RecorderState,
     hook: Option<HWINEVENTHOOK>,
-    recording_threads: Vec<JoinHandle<Result<()>>>,
+    recording_threads: Vec<JoinHandle<()>>,
     keyboard_hook: Option<HHOOK>,
     mouse_hook: Option<HHOOK>,
+    error_sender: std::sync::mpsc::Sender<anyhow::Error>,
+    error_receiver: std::sync::mpsc::Receiver<anyhow::Error>,
 }
 
 // New capture handler struct
@@ -174,6 +176,8 @@ impl GameRecorder {
     fn new(window_title: &str, output_dir: &str) -> Result<Self> {
         fs::create_dir_all(output_dir)?;
 
+        let (error_sender, error_receiver) = std::sync::mpsc::channel();
+
         let starting_session = fs::read_dir(output_dir)?
             .filter_map(|entry| entry.ok())
             .filter_map(|entry| {
@@ -197,11 +201,12 @@ impl GameRecorder {
             recording_threads: Vec::new(),
             keyboard_hook: None,
             mouse_hook: None,
+            error_sender,
+            error_receiver,
         })
     }
 
     fn start_recording(&mut self) -> Result<()> {
-        println!("=== START RECORDING ===");
         self.stop_recording()?;
 
         let input_path = self.state.get_output_path().replace(".mp4", "_inputs.parquet");
@@ -239,19 +244,24 @@ impl GameRecorder {
 
         // Start video capture using windows-capture
         let video_state = self.state.clone();
-        let video_thread = thread::spawn(move || -> Result<()> {
-            let window = Window::from_name(&video_state.window_title)?;
+        let error_sender = self.error_sender.clone();
+        let video_thread = thread::spawn(move || {
+            if let Err(e) = (|| -> Result<()> {
+                let window = Window::from_name(&video_state.window_title)?;
 
-            let settings = Settings::new(
-                window,
-                CursorCaptureSettings::WithCursor,
-                DrawBorderSettings::WithoutBorder,
-                ColorFormat::Bgra8,
-                video_state,
-            );
+                let settings = Settings::new(
+                    window,
+                    CursorCaptureSettings::WithCursor,
+                    DrawBorderSettings::WithoutBorder,
+                    ColorFormat::Bgra8,
+                    video_state,
+                );
 
-            CaptureHandler::start(settings)?;
-            Ok(())
+                CaptureHandler::start(settings)?;
+                Ok(())
+            })() {
+                let _ = error_sender.send(e);
+            }
         });
 
         self.recording_threads.push(video_thread);
@@ -298,7 +308,7 @@ impl GameRecorder {
 
         // Join video thread
         while let Some(handle) = self.recording_threads.pop() {
-            handle.join().map_err(|e| anyhow::anyhow!("Recording thread panicked: {:?}", e))??;
+            handle.join().map_err(|e| anyhow::anyhow!("Recording thread panicked: {:?}", e))?;
         }
 
         // Clear the input buffer
@@ -314,15 +324,28 @@ impl GameRecorder {
     }
 
     fn check_thread_errors(&mut self) -> Result<()> {
+        // Check for any errors sent through the channel
+        if let Ok(error) = self.error_receiver.try_recv() {
+            bail!("Recording thread error: {}", error);
+        }
+
+        // Check if any threads have finished
         let mut i = 0;
         while i < self.recording_threads.len() {
             if self.recording_threads[i].is_finished() {
-                self.recording_threads.remove(i).join()
-                    .map_err(|e| anyhow::anyhow!("Recording thread panicked: {:?}", e))??;
+                let handle = self.recording_threads.remove(i);
+                handle.join()
+                    .map_err(|e| anyhow::anyhow!("Recording thread panicked: {:?}", e))?;
             } else {
                 i += 1;
             }
         }
+
+        // Ensure we still have active threads if recording
+        if self.state.is_recording.load(Ordering::SeqCst) {
+            ensure!(!self.recording_threads.is_empty(), "All recording threads terminated unexpectedly");
+        }
+
         Ok(())
     }
 
@@ -340,7 +363,7 @@ impl GameRecorder {
 
             RegisterClassW(&wc);
 
-            let hwnd = CreateWindowExW(
+            let _window = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 window_class,
                 w!("GameRecorder"),
@@ -353,7 +376,7 @@ impl GameRecorder {
                 None,
                 None,
                 None,
-            )?;
+            ).context("Failed to create window")?;
 
             let hook = SetWinEventHook(
                 EVENT_SYSTEM_FOREGROUND,
