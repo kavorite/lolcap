@@ -1,14 +1,10 @@
 use std::{
     fs,
-    sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}},
+    sync::{Arc, atomic::{AtomicBool, AtomicUsize, AtomicPtr, Ordering}},
     thread::{self, JoinHandle},
     time::Instant,
-    path::Path,
-    ptr::addr_of,
-    io::Write,
-    mem,
     fs::File,
-    collections::VecDeque,
+    io::Write,
 };
 use arrow::datatypes::{Schema, TimeUnit};
 use windows::{
@@ -19,9 +15,9 @@ use windows::{
         WM_DESTROY, WM_USER, MSG, GetWindowTextLengthW, GetWindowTextW,
         SetWindowsHookExW, UnhookWindowsHookEx, CallNextHookEx,
         WH_KEYBOARD_LL, WH_MOUSE_LL, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT, HHOOK,
+        GetForegroundWindow, PeekMessageW, PEEK_MESSAGE_REMOVE_TYPE, WM_QUIT,
     },
-    Win32::Foundation::{HWND, WPARAM, LPARAM, LRESULT, BOOL},
-    Win32::UI::Input::KeyboardAndMouse,
+    Win32::Foundation::{HWND, WPARAM, LPARAM, LRESULT},
     Win32::UI::Accessibility::*,
     Win32::System::LibraryLoader::GetModuleHandleW,
     core::*,
@@ -60,6 +56,7 @@ struct RecorderState {
     output_directory: String,
     session_id: Arc<AtomicUsize>,
     last_window_change: Arc<Mutex<Instant>>,
+    capture_ready: Arc<AtomicBool>,
 }
 
 static RECORDER: Lazy<Arc<Mutex<Option<RecorderState>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
@@ -102,14 +99,14 @@ struct GameRecorder {
     mouse_hook: Option<HHOOK>,
     error_sender: std::sync::mpsc::Sender<anyhow::Error>,
     error_receiver: std::sync::mpsc::Receiver<anyhow::Error>,
+    window: HWND,
 }
 
 // New capture handler struct
 struct CaptureHandler {
     encoder: Option<VideoEncoder>,
     state: RecorderState,
-    target_width: u32,
-    target_height: u32,
+    start_time: Instant,
 }
 
 impl GraphicsCaptureApiHandler for CaptureHandler {
@@ -123,25 +120,20 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         let source_height = (rect.bottom - rect.top) as u32;
         println!("Source window size: {}x{}", source_width, source_height);
 
-        // Target dimensions for the final video
-        let target_width = 854;
-        let target_height = 480;
-
-        // Create encoder at source resolution
         let encoder = VideoEncoder::new(
             VideoSettingsBuilder::new(source_width, source_height)
-                .frame_rate(30)
-                .bitrate(5000),
+                .frame_rate(24)
+                .bitrate(16384),
             AudioSettingsBuilder::default().disabled(true),
             ContainerSettingsBuilder::default(),
             &ctx.flags.get_output_path(),
         )?;
 
+        println!("Encoder initialized");
         Ok(Self {
             encoder: Some(encoder),
             state: ctx.flags,
-            target_width,
-            target_height,
+            start_time: Instant::now(),
         })
     }
 
@@ -152,22 +144,36 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
     ) -> Result<(), Self::Error> {
         if !self.state.is_recording.load(Ordering::SeqCst) {
             if let Some(encoder) = self.encoder.take() {
-                encoder.finish()?;
+                // Only finish the encoder if we've processed at least one frame
+                println!("Finishing encoder");
+                match encoder.finish() {
+                    Ok(_) => println!("Encoder finished successfully"),
+                    Err(e) => println!("Error finishing encoder: {}", e),
+                }
             }
             capture_control.stop();
             return Ok(());
         }
 
-        // Now we're capturing at full window resolution
-        if let Some(encoder) = &mut self.encoder {
-            encoder.send_frame(frame)?;
-        }
+        // Add frame processing status
+        print!("\rRecording for: {} seconds", self.start_time.elapsed().as_secs());
+        std::io::stdout().flush()?;
 
+        if let Some(encoder) = &mut self.encoder {
+            encoder.send_frame(frame).context("Failed to send frame to encoder")?;
+        }
+        
         Ok(())
     }
 
     fn on_closed(&mut self) -> Result<(), Self::Error> {
-        println!("Capture session ended");
+        println!("\nCapture session ended");
+        if let Some(encoder) = self.encoder.take() {
+            match encoder.finish() {
+                Ok(_) => println!("Encoder finished successfully on close"),
+                Err(e) => println!("Error finishing encoder on close: {}", e),
+            }
+        }
         Ok(())
     }
 }
@@ -196,6 +202,7 @@ impl GameRecorder {
                 output_directory: output_dir.to_string(),
                 session_id: Arc::new(AtomicUsize::new(starting_session)),
                 last_window_change: Arc::new(Mutex::new(Instant::now())),
+                capture_ready: Arc::new(AtomicBool::new(false)),
             },
             hook: None,
             recording_threads: Vec::new(),
@@ -203,10 +210,14 @@ impl GameRecorder {
             mouse_hook: None,
             error_sender,
             error_receiver,
+            window: HWND(std::ptr::null_mut()),
         })
     }
 
     fn start_recording(&mut self) -> Result<()> {
+        // Clean up any old recording threads that have finished
+        self.recording_threads.retain(|handle| !handle.is_finished());
+        
         self.stop_recording()?;
 
         let input_path = self.state.get_output_path().replace(".mp4", "_inputs.parquet");
@@ -223,6 +234,9 @@ impl GameRecorder {
             Some(props),
         )?);
         *START_TIME.lock().unwrap() = Some(Instant::now());
+
+        // Set recording flag before starting capture
+        self.state.is_recording.store(true, Ordering::SeqCst);
 
         // Set up input hooks
         unsafe {
@@ -246,21 +260,57 @@ impl GameRecorder {
         let video_state = self.state.clone();
         let error_sender = self.error_sender.clone();
         let video_thread = thread::spawn(move || {
-            if let Err(e) = (|| -> Result<()> {
-                let window = Window::from_name(&video_state.window_title)?;
+            println!("Video capture thread started");
+            
+            // First verify we're actually focused on the target window
+            if let Some(current_title) = unsafe { get_window_title(GetForegroundWindow()) } {
+                if current_title != video_state.window_title {
+                    println!("Wrong window focused (current: {}, target: {})", 
+                        current_title, video_state.window_title);
+                    return;
+                }
+            }
+            
+            // Try to get a valid window size with retries
+            let mut retry_count = 0;
+            let window = loop {
+                match Window::from_name(&video_state.window_title) {
+                    Ok(w) => {
+                        // Verify window size is valid
+                        if let Ok(rect) = w.rect() {
+                            let width = (rect.right - rect.left) as u32;
+                            let height = (rect.bottom - rect.top) as u32;
+                            if width > 1 && height > 1 {
+                                println!("Found valid window size: {}x{}", width, height);
+                                break w;
+                            }
+                        }
+                    },
+                    Err(e) => println!("Failed to get window: {}", e),
+                }
+                
+                retry_count += 1;
+                if retry_count > 10 {
+                    if let Err(_) = error_sender.send(anyhow::Error::msg("Failed to get valid window size after 10 retries")) {
+                        return;
+                    }
+                    return;
+                }
+                thread::sleep(std::time::Duration::from_millis(100));
+            };
 
-                let settings = Settings::new(
-                    window,
-                    CursorCaptureSettings::WithCursor,
-                    DrawBorderSettings::WithoutBorder,
-                    ColorFormat::Bgra8,
-                    video_state,
-                );
-
-                CaptureHandler::start(settings)?;
-                Ok(())
-            })() {
-                let _ = error_sender.send(e);
+            let settings = Settings::new(
+                window,
+                CursorCaptureSettings::WithCursor,
+                DrawBorderSettings::WithoutBorder,
+                ColorFormat::Bgra8,
+                video_state.clone(),
+            );
+            
+            println!("Starting capture session");
+            if let Err(e) = CaptureHandler::start(settings) {
+                println!("Failed to start capture: {}", e);
+                let _ = error_sender.send(anyhow::Error::new(e));
             }
         });
 
@@ -270,6 +320,9 @@ impl GameRecorder {
     }
 
     fn stop_recording(&mut self) -> Result<()> {
+        // Set recording flag to false first
+        self.state.is_recording.store(false, Ordering::SeqCst);
+        
         // Clean up hooks
         if let Some(hook) = self.keyboard_hook.take() {
             unsafe { UnhookWindowsHookEx(hook)? };
@@ -278,7 +331,7 @@ impl GameRecorder {
             unsafe { UnhookWindowsHookEx(hook)? };
         }
 
-        // Write any remaining buffered events
+        // Write any remaining buffered events and close writer
         {
             let buffer = INPUT_BUFFER.lock().unwrap();
             if !buffer.timestamps.is_empty() {
@@ -300,16 +353,10 @@ impl GameRecorder {
             }
         }
 
-        // Close Arrow writer
         if let Some(writer) = INPUT_WRITER.lock().unwrap().take() {
             writer.close()?;
         }
         *START_TIME.lock().unwrap() = None;
-
-        // Join video thread
-        while let Some(handle) = self.recording_threads.pop() {
-            handle.join().map_err(|e| anyhow::anyhow!("Recording thread panicked: {:?}", e))?;
-        }
 
         // Clear the input buffer
         let mut buffer = INPUT_BUFFER.lock().unwrap();
@@ -320,6 +367,9 @@ impl GameRecorder {
         buffer.y_coords.clear();
         buffer.flags.clear();
 
+        // Don't wait for the recording threads here
+        // Just let them finish on their own when they detect recording has stopped
+        println!("Recording stopped successfully");
         Ok(())
     }
 
@@ -363,7 +413,7 @@ impl GameRecorder {
 
             RegisterClassW(&wc);
 
-            let _window = CreateWindowExW(
+            let window = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 window_class,
                 w!("GameRecorder"),
@@ -377,6 +427,10 @@ impl GameRecorder {
                 None,
                 None,
             ).context("Failed to create window")?;
+
+            self.window = window;
+
+            RECORDER_WINDOW.store(window.0, Ordering::SeqCst);
 
             let hook = SetWinEventHook(
                 EVENT_SYSTEM_FOREGROUND,
@@ -401,7 +455,7 @@ impl GameRecorder {
                         }
                     },
                     _ => {
-                        TranslateMessage(&message);
+                        let _ = TranslateMessage(&message);
                         DispatchMessageW(&message);
                     }
                 }
@@ -425,27 +479,39 @@ impl GameRecorder {
         }
 
         if let Some(title) = get_window_title(hwnd) {
+            println!("Window focus changed to: {}", title);
+
             if title == "Task Switching" {
+                println!("Ignoring task switcher");
                 return;
             }
 
             if let Some(state) = RECORDER.lock().unwrap().as_ref() {
                 let title_matches = title == state.window_title;
-                let is_recording = state.is_recording.load(Ordering::SeqCst);
+                let recorder_window = HWND(RECORDER_WINDOW.load(Ordering::SeqCst));
+                
+                // Only use debounce for rapid switches between different windows
+                let should_debounce = {
+                    let last_change = state.last_window_change.lock().unwrap();
+                    last_change.elapsed() < std::time::Duration::from_millis(500)
+                };
 
-                match (title_matches, is_recording) {
-                    (true, false) => {
+                // Update last window change time
+                if let Ok(mut last_change) = state.last_window_change.lock() {
+                    *last_change = Instant::now();
+                }
+                
+                if title_matches {
+                    if !should_debounce {
+                        println!("Target window focused - sending start recording message");
                         state.session_id.fetch_add(1, Ordering::SeqCst);
-                        state.is_recording.store(true, Ordering::SeqCst);
-                        if PostMessageW(Some(HWND(std::ptr::null_mut())), WM_USER, WPARAM(1), LPARAM(0)).is_err() {
-                            state.is_recording.store(false, Ordering::SeqCst);
-                        }
-                    },
-                    (false, true) => {
-                        state.is_recording.store(false, Ordering::SeqCst);
-                        let _ = PostMessageW(Some(HWND(std::ptr::null_mut())), WM_USER, WPARAM(0), LPARAM(0));
-                    },
-                    _ => {}
+                        let _ = PostMessageW(recorder_window, WM_USER, WPARAM(1), LPARAM(0));
+                    } else {
+                        println!("Ignoring rapid window switch to target window");
+                    }
+                } else {
+                    println!("Other window focused - sending stop recording message");
+                    let _ = PostMessageW(recorder_window, WM_USER, WPARAM(0), LPARAM(0));
                 }
             }
         }
@@ -578,6 +644,9 @@ unsafe fn get_window_title(hwnd: HWND) -> Option<String> {
 
     String::from_utf16_lossy(&title[..len as usize]).into()
 }
+
+// Add a static for the window handle
+static RECORDER_WINDOW: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 fn main() -> Result<()> {
     let mut recorder = GameRecorder::new(
